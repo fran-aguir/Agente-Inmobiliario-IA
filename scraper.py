@@ -371,6 +371,18 @@ def get_or_create_sheet() -> gspread.Worksheet:
         spreadsheet.batch_update(body)
         log.info("  Encabezados y formato aplicados.")
 
+    # Compartir con el dueño del agente (se ejecuta siempre por si acaso)
+    try:
+        spreadsheet.share(
+            'carlosfco.aguilar18@gmail.com',
+            perm_type='user',
+            role='writer',
+            notify=False,
+        )
+        log.info("  Hoja compartida con carlosfco.aguilar18@gmail.com")
+    except Exception as e:
+        log.warning(f"  No se pudo compartir la hoja: {e}")
+
     return sheet
 
 
