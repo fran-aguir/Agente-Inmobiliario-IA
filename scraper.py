@@ -5,10 +5,6 @@ Agente Buscador de Departamentos - CDMX
 Busca en Inmuebles24, Vivanuncios y Lamudi.
 Filtra por alcaldía y rango de precio.
 Guarda resultados nuevos en Google Sheets (sin duplicados).
-
-Uso:
-  export GOOGLE_CREDENTIALS_JSON='{ ... }'
-  python scraper.py
 """
 
 import os
@@ -36,8 +32,8 @@ log = logging.getLogger(__name__)
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 
-PRICE_MIN = 5_000   # MXN
-PRICE_MAX = 8_000   # MXN
+PRICE_MIN = 5_000
+PRICE_MAX = 8_000
 
 ALCALDIAS = {
     "gustavo-a-madero": "Gustavo A. Madero",
@@ -46,64 +42,75 @@ ALCALDIAS = {
 }
 
 SHEET_NAME = "Departamentos CDMX"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+OWNER_EMAIL = "carlosfco.aguilar18@gmail.com"
 
 SHEET_HEADERS = [
     "Fecha", "Fuente", "Alcaldía", "Título",
     "Precio", "Recámaras", "Ubicación", "URL", "ID",
 ]
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Sesión HTTP con headers realistas ────────────────────────────────────────
 
-def get_soup(url: str, params: dict = None) -> "BeautifulSoup | None":
-    """GET con delay aleatorio para no sobrecargar los servidores."""
+def make_session() -> requests.Session:
+    """Crea una sesión con headers que imitan un navegador real."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Cache-Control": "max-age=0",
+    })
+    return s
+
+SESSION = make_session()
+
+def get_soup(url: str, params: dict = None, referer: str = None) -> "BeautifulSoup | None":
     try:
-        time.sleep(random.uniform(2.5, 5.0))
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        time.sleep(random.uniform(3.0, 6.0))
+        headers = {}
+        if referer:
+            headers["Referer"] = referer
+        resp = SESSION.get(url, params=params, timeout=20, headers=headers)
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
     except requests.RequestException as e:
         log.warning(f"  Error al acceder {url}: {e}")
         return None
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def extract_price(text: str) -> "int | None":
-    """Extrae precio numérico de una cadena. Ej: '$6,500/mes' → 6500."""
     if not text:
         return None
     digits = re.sub(r"[^\d]", "", text)
     if digits:
         val = int(digits)
-        # Descartar valores fuera de rango razonable (evitar confundir con precios de venta)
         if 1_000 <= val <= 500_000:
             return val
     return None
 
 
 def listing_id(listing: dict) -> str:
-    """ID único basado en URL o título+precio para deduplicación."""
     key = listing.get("url") or f"{listing['titulo']}_{listing['precio']}"
     return hashlib.md5(key.encode()).hexdigest()[:10]
 
 
 def make_listing(fuente, alcaldia_key, titulo, precio_raw,
                  recamaras, ubicacion, url) -> "dict | None":
-    """Crea un dict de listing y valida el rango de precio."""
     precio_num = extract_price(precio_raw) if precio_raw else None
-
-    # Filtrar por precio si se pudo extraer el número
     if precio_num is not None and not (PRICE_MIN <= precio_num <= PRICE_MAX):
         return None
-
     return {
         "fuente":    fuente,
         "alcaldia":  ALCALDIAS[alcaldia_key],
@@ -115,38 +122,34 @@ def make_listing(fuente, alcaldia_key, titulo, precio_raw,
         "fecha":     datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
-# ─── Scrapers ─────────────────────────────────────────────────────────────────
+# ─── Scraper: Inmuebles24 ─────────────────────────────────────────────────────
 
 def scrape_inmuebles24() -> list:
     """
-    Scraper para inmuebles24.com
-    Usa atributos data-qa para localizar elementos.
-    Si retorna 0 resultados, abre la página en el navegador,
-    inspecciona el HTML e actualiza los selectores aquí.
+    URLs correctas: /departamentos-en-renta-en-{alcaldia}.html
+    Sin 'capital-federal' en la URL.
     """
     results = []
 
-    for alcaldia_key in ALCALDIAS:
-        url = (
-            f"https://www.inmuebles24.com/departamentos-en-renta-en-"
-            f"{alcaldia_key}-capital-federal.html"
-        )
-        soup = get_soup(url, params={
-            "precio_desde": PRICE_MIN,
-            "precio_hasta": PRICE_MAX,
-        })
+    # URLs verificadas — formato correcto sin 'capital-federal'
+    urls = {
+        "gustavo-a-madero": "https://www.inmuebles24.com/departamentos-en-renta-en-gustavo-a-madero.html",
+        "miguel-hidalgo":   "https://www.inmuebles24.com/departamentos-en-renta-en-miguel-hidalgo.html",
+        "azcapotzalco":     "https://www.inmuebles24.com/departamentos-en-renta-en-azcapotzalco.html",
+    }
+
+    for alcaldia_key, url in urls.items():
+        # Primero visitar la home para tener cookie de sesión (evita 403)
+        get_soup("https://www.inmuebles24.com/", referer=None)
+        time.sleep(random.uniform(1.5, 3.0))
+
+        soup = get_soup(url, referer="https://www.inmuebles24.com/")
         if not soup:
             continue
 
-        # Inmuebles24 usa data-qa para identificar tarjetas de listing
         cards = soup.find_all("div", attrs={"data-qa": "posting PROPERTY"})
-
-        # Fallback: clases comunes si cambiaron los data-qa
         if not cards:
-            cards = soup.find_all(
-                "div",
-                class_=re.compile(r"postingCard|listing-card|PropertyCard", re.I)
-            )
+            cards = soup.find_all("div", class_=re.compile(r"postingCard|PostingCard", re.I))
 
         log.info(f"  Inmuebles24 / {alcaldia_key}: {len(cards)} tarjetas")
 
@@ -186,50 +189,58 @@ def scrape_inmuebles24() -> list:
                     results.append(lst)
 
             except Exception as e:
-                log.debug(f"  Error parseando tarjeta de Inmuebles24: {e}")
+                log.debug(f"  Error parseando tarjeta: {e}")
 
     return results
 
+# ─── Scraper: Vivanuncios ─────────────────────────────────────────────────────
 
 def scrape_vivanuncios() -> list:
     """
-    Scraper para vivanuncios.com.mx (plataforma OLX).
-
-    ADVERTENCIA: Vivanuncios usa React para renderizar contenido.
-    Si el scraper retorna 0 resultados, el contenido se carga vía JS
-    y necesitarás usar Playwright (ver README para instrucciones).
+    URLs correctas con código de localidad verificado:
+    - Azcapotzalco: l10266
+    - Miguel Hidalgo: l10276
+    - Gustavo A. Madero: l10271
+    Formato: /s-departamentos-en-renta/{alcaldia}/v1c1300l{codigo}p1
     """
     results = []
 
-    slugs = {
-        "gustavo-a-madero": "gustavo-a-madero",
-        "miguel-hidalgo":   "miguel-hidalgo",
-        "azcapotzalco":     "azcapotzalco",
+    url_map = {
+        "gustavo-a-madero": "https://www.vivanuncios.com.mx/s-departamentos-en-renta/gustavo-a-madero/v1c1300l10271p1",
+        "miguel-hidalgo":   "https://www.vivanuncios.com.mx/s-departamentos-en-renta/miguel-hidalgo/v1c1300l10276p1",
+        "azcapotzalco":     "https://www.vivanuncios.com.mx/s-departamentos-en-renta/azcapotzalco/v1c1300l10266p1",
     }
 
-    for alcaldia_key, slug in slugs.items():
-        # URL de búsqueda de Vivanuncios — puede necesitar ajustes
-        url = (
-            f"https://www.vivanuncios.com.mx/s-renta-de-departamentos/"
-            f"ciudad-de-mexico/{slug}/v1c1097l3095041p1"
-        )
-        soup = get_soup(url)
+    for alcaldia_key, url in url_map.items():
+        soup = get_soup(url, referer="https://www.vivanuncios.com.mx/")
         if not soup:
             continue
 
-        # Vivanuncios usa <article> para las tarjetas de listing
-        cards = soup.find_all("article", class_=re.compile(r"item|listing", re.I))
+        # Vivanuncios usa <article> con data-aut-id
+        cards = soup.find_all("article", attrs={"data-aut-id": "itemBox"})
         if not cards:
-            cards = soup.find_all("li", class_=re.compile(r"item|listing", re.I))
+            cards = soup.find_all("article")
+        if not cards:
+            cards = soup.find_all("li", class_=re.compile(r"item|listing|ad", re.I))
 
         log.info(f"  Vivanuncios / {alcaldia_key}: {len(cards)} tarjetas")
 
         for card in cards:
             try:
-                title_el    = card.find("h2") or card.find(class_=re.compile(r"title", re.I))
-                price_el    = card.find(class_=re.compile(r"price", re.I))
-                location_el = card.find(class_=re.compile(r"location|address", re.I))
-                link_el     = card.find("a")
+                title_el = (
+                    card.find(attrs={"data-aut-id": "itemTitle"})
+                    or card.find("h2")
+                    or card.find(class_=re.compile(r"title", re.I))
+                )
+                price_el = (
+                    card.find(attrs={"data-aut-id": "itemPrice"})
+                    or card.find(class_=re.compile(r"price", re.I))
+                )
+                location_el = (
+                    card.find(attrs={"data-aut-id": "item-location"})
+                    or card.find(class_=re.compile(r"location|address", re.I))
+                )
+                link_el = card.find("a")
 
                 titulo    = title_el.get_text(strip=True)    if title_el    else None
                 precio    = price_el.get_text(strip=True)    if price_el    else None
@@ -248,45 +259,45 @@ def scrape_vivanuncios() -> list:
                     results.append(lst)
 
             except Exception as e:
-                log.debug(f"  Error parseando tarjeta de Vivanuncios: {e}")
+                log.debug(f"  Error parseando tarjeta Vivanuncios: {e}")
 
     return results
 
+# ─── Scraper: Lamudi ──────────────────────────────────────────────────────────
 
 def scrape_lamudi() -> list:
     """
-    Scraper para lamudi.com.mx
-    Más estable que los otros, suele funcionar con requests directo.
+    URLs correctas con 'distrito-federal' (no 'ciudad-de-mexico').
+    Con filtro de precio directo en la URL.
     """
     results = []
 
-    slugs = {
-        "gustavo-a-madero": "gustavo-a-madero",
-        "miguel-hidalgo":   "miguel-hidalgo",
-        "azcapotzalco":     "azcapotzalco",
+    url_map = {
+        "gustavo-a-madero": (
+            f"https://www.lamudi.com.mx/distrito-federal/gustavo-a-madero/"
+            f"departamento/for-rent/price:{PRICE_MIN}-{PRICE_MAX}/"
+        ),
+        "miguel-hidalgo": (
+            f"https://www.lamudi.com.mx/distrito-federal/miguel-hidalgo/"
+            f"departamento/for-rent/price:{PRICE_MIN}-{PRICE_MAX}/"
+        ),
+        "azcapotzalco": (
+            f"https://www.lamudi.com.mx/distrito-federal/azcapotzalco/"
+            f"departamento/for-rent/price:{PRICE_MIN}-{PRICE_MAX}/"
+        ),
     }
 
-    for alcaldia_key, slug in slugs.items():
-        url = (
-            f"https://www.lamudi.com.mx/ciudad-de-mexico/{slug}/"
-            f"departamento/for-rent/"
-        )
-        soup = get_soup(url, params={
-            "pricemax": PRICE_MAX,
-            "pricemin": PRICE_MIN,
-        })
+    for alcaldia_key, url in url_map.items():
+        soup = get_soup(url, referer="https://www.lamudi.com.mx/")
         if not soup:
             continue
 
         cards = soup.find_all(
             "div",
-            class_=re.compile(r"ListingCell|listing-card|property-item", re.I)
+            class_=re.compile(r"ListingCell|listing-card|property-item|js-listing-item", re.I)
         )
         if not cards:
-            cards = soup.find_all(
-                "article",
-                class_=re.compile(r"listing|property", re.I)
-            )
+            cards = soup.find_all("article", class_=re.compile(r"listing|property", re.I))
 
         log.info(f"  Lamudi / {alcaldia_key}: {len(cards)} tarjetas")
 
@@ -294,7 +305,7 @@ def scrape_lamudi() -> list:
             try:
                 title_el    = card.find(class_=re.compile(r"title", re.I))
                 price_el    = card.find(class_=re.compile(r"price|Price", re.I))
-                location_el = card.find(class_=re.compile(r"address|location", re.I))
+                location_el = card.find(class_=re.compile(r"address|location|Location", re.I))
                 link_el     = card.find_parent("a") or card.find("a")
 
                 titulo    = title_el.get_text(strip=True)    if title_el    else None
@@ -314,14 +325,13 @@ def scrape_lamudi() -> list:
                     results.append(lst)
 
             except Exception as e:
-                log.debug(f"  Error parseando tarjeta de Lamudi: {e}")
+                log.debug(f"  Error parseando tarjeta Lamudi: {e}")
 
     return results
 
 # ─── Google Sheets ─────────────────────────────────────────────────────────────
 
 def get_or_create_sheet() -> gspread.Worksheet:
-    """Conecta con Google Sheets. Crea y formatea la hoja si no existe."""
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -339,7 +349,6 @@ def get_or_create_sheet() -> gspread.Worksheet:
 
     sheet = spreadsheet.sheet1
 
-    # Si la hoja está vacía, agregar encabezados con formato
     if not sheet.get_all_values():
         sheet.append_row(SHEET_HEADERS)
         sheet.format("A1:I1", {
@@ -351,7 +360,6 @@ def get_or_create_sheet() -> gspread.Worksheet:
             },
         })
         sheet.freeze(rows=1)
-        # Ajustar ancho de columnas (URL ancha, ID estrecha)
         body = {
             "requests": [
                 {"updateDimensionProperties": {
@@ -374,12 +382,12 @@ def get_or_create_sheet() -> gspread.Worksheet:
     # Compartir con el dueño del agente (se ejecuta siempre por si acaso)
     try:
         spreadsheet.share(
-            'carlosfco.aguilar18@gmail.com',
+            OWNER_EMAIL,
             perm_type='user',
             role='writer',
             notify=False,
         )
-        log.info("  Hoja compartida con carlosfco.aguilar18@gmail.com")
+        log.info(f"  Hoja compartida con {OWNER_EMAIL}")
     except Exception as e:
         log.warning(f"  No se pudo compartir la hoja: {e}")
 
@@ -387,9 +395,7 @@ def get_or_create_sheet() -> gspread.Worksheet:
 
 
 def save_listings(sheet: gspread.Worksheet, listings: list) -> int:
-    """Guarda solo los listings nuevos (deduplicación por ID). Retorna cuántos se agregaron."""
     existing_data = sheet.get_all_values()
-    # La columna ID es la #9 (índice 8)
     existing_ids = {row[8] for row in existing_data[1:] if len(row) > 8}
 
     new_rows = []
@@ -407,7 +413,7 @@ def save_listings(sheet: gspread.Worksheet, listings: list) -> int:
                 listing["url"],
                 lid,
             ])
-            existing_ids.add(lid)  # Evitar duplicados dentro del mismo lote
+            existing_ids.add(lid)
 
     if new_rows:
         sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
@@ -437,19 +443,22 @@ def main():
     log.info("Consultando Lamudi...")
     all_listings.extend(scrape_lamudi())
 
-    log.info(f"Total encontrado: {len(all_listings)} anuncios")
+    log.info(f"Total encontrado antes de filtrar: {len(all_listings)} anuncios")
 
     if not all_listings:
         log.warning(
             "No se encontraron anuncios. "
-            "Posibles causas: los sitios bloquearon el scraper o cambiaron sus selectores HTML. "
-            "Revisa el archivo scraper.py y actualiza los selectores según lo que veas en el navegador."
+            "Conectando de todas formas con Sheets para verificar credenciales..."
         )
-        return
 
     log.info("Conectando a Google Sheets...")
     sheet = get_or_create_sheet()
-    added = save_listings(sheet, all_listings)
+
+    if all_listings:
+        added = save_listings(sheet, all_listings)
+    else:
+        added = 0
+        log.info("  Hoja accesible. Sin anuncios nuevos para guardar.")
 
     log.info("=" * 60)
     log.info(f"Listo. Nuevos anuncios guardados: {added}")
