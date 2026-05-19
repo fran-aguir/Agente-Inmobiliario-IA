@@ -41,7 +41,8 @@ ALCALDIAS = {
     "azcapotzalco":     "Azcapotzalco",
 }
 
-SHEET_NAME = "Departamentos CDMX"
+SHEET_NAME  = "Departamentos CDMX"
+SHEET_ID    = "1hXmBLPT9oip5MM-JYFUo4yl4IpaCtukCfB9SeqpHNwo"
 OWNER_EMAIL = "carlosfco.aguilar18@gmail.com"
 
 SHEET_HEADERS = [
@@ -340,12 +341,9 @@ def get_or_create_sheet() -> gspread.Worksheet:
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
 
-    try:
-        spreadsheet = client.open(SHEET_NAME)
-        log.info(f"  Hoja existente encontrada: {SHEET_NAME}")
-    except gspread.SpreadsheetNotFound:
-        spreadsheet = client.create(SHEET_NAME)
-        log.info(f"  Hoja nueva creada: {SHEET_NAME}")
+    # Abrir por ID directo — la hoja ya existe en el Drive del usuario
+    spreadsheet = client.open_by_key(SHEET_ID)
+    log.info(f"  Hoja encontrada: {spreadsheet.title}")
 
     sheet = spreadsheet.sheet1
 
