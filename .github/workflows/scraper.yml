@@ -19,11 +19,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar dependencias
+      - name: Instalar dependencias Python
         run: pip install -r requirements.txt
 
       - name: Instalar navegador Playwright
-        run: playwright install chromium --with-deps
+        run: |
+          sudo apt-get install -y libasound2t64
+          playwright install chromium
 
       - name: Ejecutar scraper
         env:
