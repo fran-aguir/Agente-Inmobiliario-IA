@@ -2,16 +2,13 @@ name: Buscar Departamentos CDMX
 
 on:
   schedule:
-    # Corre a las 7am, 1pm, 7pm y 1am hora CDMX (UTC-6)
     - cron: '0 13,19,1,7 * * *'
-  
-  # También puedes ejecutarlo manualmente desde la pestaña Actions en GitHub
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Descargar código
@@ -21,20 +18,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Instalar dependencias
         run: pip install -r requirements.txt
+
+      - name: Instalar navegador Playwright
+        run: playwright install chromium --with-deps
 
       - name: Ejecutar scraper
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python scraper.py
-
-      - name: Guardar logs (opcional, para debugging)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scraper-logs-${{ github.run_id }}
-          path: '*.log'
-          retention-days: 7
